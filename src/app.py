@@ -3,11 +3,11 @@
 import sys
 import os
 import hashlib
+import hmac
 import struct
 import zlib
 import time
 import threading
-import base64
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -19,11 +19,9 @@ sys.dont_write_bytecode = True
 try:
     import customtkinter as ctk
     from PIL import Image
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-    from cryptography.fernet import Fernet
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except ImportError:
     print("Installing dependencies...")
     import subprocess
@@ -41,16 +39,39 @@ except ImportError:
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-MAGIC = b"Crypto"
-VERSION = 1
-SALT_SIZE = 32
-NONCE_SIZE = 12
-KEY_SIZE = 32
+# --- Primitive crittografiche condivise (file + steganografia) ---
+ALGO_AES256GCM = 0x01
+SUPPORTED_ALGORITHMS = {ALGO_AES256GCM: "AES-256-GCM"}
 
+SALT_SIZE = 32          # byte casuali per operazione
+NONCE_SIZE = 12         # byte casuali per operazione
+KEY_SIZE = 32           # AES-256
+MAC_KEY_SIZE = 32       # chiave HMAC, derivata dalla stessa password
+MAC_SIZE = 32           # HMAC-SHA256
+TAG_SIZE = 16           # tag di autenticazione GCM
+SHA_SIZE = 32           # SHA-256 del plaintext originale
+
+SCRYPT_N = 2 ** 15
+SCRYPT_R = 8
+SCRYPT_P = 1
+
+# --- Formato .crypton ---
+MAGIC = b"CRYPTON"
+VERSION = 2
+FLAG_COMPRESSED = 0x01
+MAX_EXT_LEN = 255
+# magic | version | algo | flags | salt | nonce | timestamp | size | sha256 | ext_len
+HEADER_FMT = '<7sHBB32s12sQQ32sH'
+HEADER_FIXED_SIZE = struct.calcsize(HEADER_FMT)
+
+# --- Steganografia ---
 STEGO_MAGIC_LSB = b'STEGO\x00'
 STEGO_MAGIC_APP = b'\x00HIDDEN_FILE_START\x00'
 STEGO_END_APP = b'\x00HIDDEN_FILE_END\x00'
 STEGO_ENCRYPT_MARKER = b'ENCRYPTED_AES256_GCM_'
+# marker | algo | salt | nonce | sha256   (seguiti da HMAC e ciphertext)
+STEGO_META_SIZE = len(STEGO_ENCRYPT_MARKER) + 1 + SALT_SIZE + NONCE_SIZE + SHA_SIZE
+LOSSLESS_EXTENSIONS = {'.png', '.bmp', '.tif', '.tiff'}
 
 
 # ============================================================================
@@ -89,318 +110,391 @@ def setup_theme():
 
 
 # ============================================================================
-# CRYPTO CORE
+# ERRORS
+# ============================================================================
+class CryptonError(Exception):
+    default_message = "Errore Crypton"
+
+    def __init__(self, message=None):
+        super().__init__(message or self.default_message)
+
+
+class InvalidFormatError(CryptonError):
+    default_message = "Il file non è un Crypton valido"
+
+
+class UnsupportedAlgorithmError(CryptonError):
+    default_message = "Algoritmo di cifratura non riconosciuto"
+
+
+class WrongPasswordError(CryptonError):
+    default_message = "Password errata o file corrotto"
+
+
+class IntegrityError(CryptonError):
+    default_message = "L'integrità del file è compromessa"
+
+
+# ============================================================================
+# CRYPTO ENGINE (unico, condiviso da crittografia file e steganografia)
+# ============================================================================
+class CryptoEngine:
+    """AES-256-GCM + Scrypt + HMAC-SHA256.
+
+    Ogni blob cifrato ha la stessa struttura:
+        header (con salt, nonce, SHA-256 del plaintext) | HMAC-SHA256(header) | ciphertext+tag
+    L'header e l'HMAC sono inoltre passati come AAD a GCM.
+    """
+
+    @staticmethod
+    def sha256(data):
+        return hashlib.sha256(data).digest()
+
+    def derive_keys(self, password, salt):
+        """Scrypt -> 64 byte: 32 per AES-256, 32 per l'HMAC dell'header."""
+        pw = bytearray(password.encode('utf-8'))
+        try:
+            kdf = Scrypt(salt=salt, length=KEY_SIZE + MAC_KEY_SIZE,
+                         n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
+            material = kdf.derive(pw)
+        finally:
+            for i in range(len(pw)):
+                pw[i] = 0
+        return material[:KEY_SIZE], material[KEY_SIZE:]
+
+    @staticmethod
+    def header_mac(mac_key, header):
+        return hmac.new(mac_key, header, hashlib.sha256).digest()
+
+    def seal(self, payload, password, build_header):
+        """Cifra `payload`. build_header(salt, nonce) deve restituire i byte dell'header."""
+        salt = os.urandom(SALT_SIZE)
+        nonce = os.urandom(NONCE_SIZE)
+        enc_key, mac_key = self.derive_keys(password, salt)
+        header = build_header(salt, nonce)
+        mac = self.header_mac(mac_key, header)
+        ciphertext = AESGCM(enc_key).encrypt(nonce, payload, header + mac)
+        return header + mac + ciphertext
+
+    def open(self, data, header_end, password, salt, nonce):
+        """Verifica HMAC dell'header, poi decifra.
+
+        - HMAC non valido      -> password errata o header corrotto
+        - HMAC valido, tag KO  -> password giusta ma ciphertext manomesso
+        """
+        enc_key, mac_key = self.derive_keys(password, salt)
+        mac_end = header_end + MAC_SIZE
+        expected = self.header_mac(mac_key, data[:header_end])
+        if not hmac.compare_digest(expected, data[header_end:mac_end]):
+            raise WrongPasswordError()
+        try:
+            return AESGCM(enc_key).decrypt(nonce, data[mac_end:], data[:mac_end])
+        except InvalidTag:
+            raise IntegrityError()
+
+
+# ============================================================================
+# CRYPTO CORE (formato .crypton)
 # ============================================================================
 class CryptoCore:
-    """ChaCha20-Poly1305 + Argon2id Encryption"""
-    
-    def _derive_key(self, password, salt, time_cost=3, memory_cost=64*1024):
-        kdf = Argon2id(salt=salt, length=KEY_SIZE, 
-                       iterations=time_cost, lanes=4, memory_cost=memory_cost)
-        return kdf.derive(password)
-    
+    """Cifratura file: AES-256-GCM + Scrypt"""
+
+    def __init__(self, engine=None):
+        self.engine = engine or CryptoEngine()
+
+    @staticmethod
+    def _safe_ext(raw):
+        """Estensione come stringa; scartata se sospetta (usata solo per i nomi file)."""
+        try:
+            ext = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return ""
+        if ext and (not ext.startswith('.') or any(c in ext for c in '/\\:\x00')):
+            return ""
+        return ext
+
+    def _parse(self, head, total_size):
+        """Analizza l'header (non ancora autenticato). `head` può essere solo l'inizio del file."""
+        if len(head) < len(MAGIC) or head[:len(MAGIC)] != MAGIC:
+            raise InvalidFormatError()
+        if len(head) < HEADER_FIXED_SIZE:
+            raise InvalidFormatError()
+
+        (_magic, version, algo, flags, salt, nonce,
+         timestamp, size, sha, ext_len) = struct.unpack(HEADER_FMT, head[:HEADER_FIXED_SIZE])
+
+        if version != VERSION:
+            raise InvalidFormatError(f"Versione del formato non supportata: {version}")
+        if algo not in SUPPORTED_ALGORITHMS:
+            raise UnsupportedAlgorithmError()
+        if ext_len > MAX_EXT_LEN:
+            raise InvalidFormatError()
+
+        header_end = HEADER_FIXED_SIZE + ext_len
+        mac_end = header_end + MAC_SIZE
+        if len(head) < mac_end or total_size < mac_end + TAG_SIZE:
+            raise InvalidFormatError()
+
+        return {
+            'version': version,
+            'algorithm': SUPPORTED_ALGORITHMS[algo],
+            'compressed': bool(flags & FLAG_COMPRESSED),
+            'salt': salt,
+            'nonce': nonce,
+            'timestamp': timestamp,
+            'size_original': size,
+            'sha256': sha,
+            'extension': self._safe_ext(head[HEADER_FIXED_SIZE:header_end]),
+            'header_end': header_end,
+        }
+
+    def _decrypt_bytes(self, data, password):
+        h = self._parse(data, len(data))
+        payload = self.engine.open(data, h['header_end'], password, h['salt'], h['nonce'])
+
+        if h['compressed']:
+            try:
+                plaintext = zlib.decompress(payload)
+            except zlib.error:
+                raise IntegrityError()
+        else:
+            plaintext = payload
+
+        if len(plaintext) != h['size_original'] or \
+                not hmac.compare_digest(self.engine.sha256(plaintext), h['sha256']):
+            raise IntegrityError()
+        return plaintext, h
+
     def encrypt(self, input_path, output_path, password):
         input_path = Path(input_path)
         output_path = Path(output_path)
-        
-        with open(input_path, 'rb') as f:
-            plaintext = f.read()
-        
-        plaintext = zlib.compress(plaintext, level=9)
-        compressed = True
-        
-        password_bytes = password.encode('utf-8')
-        salt = os.urandom(SALT_SIZE)
-        key = self._derive_key(password_bytes, salt)
-        
-        nonce = os.urandom(NONCE_SIZE)
-        cipher = ChaCha20Poly1305(key)
-        ciphertext = cipher.encrypt(nonce, plaintext, None)
-        
-        header = bytearray()
-        header.extend(MAGIC)
-        header.extend(struct.pack('<H', VERSION))
-        header.extend(struct.pack('<Q', len(plaintext)))
-        header.extend(salt)
-        header.extend(nonce)
-        header.extend(struct.pack('<H', 0))
-        header.extend(struct.pack('<Q', int(time.time())))
-        
-        flags = 0
-        if compressed: flags |= 1 << 3
-        header.append(flags)
-        
-        header_hmac = hashlib.sha256(header).digest()[:8]
-        header.extend(header_hmac)
-        
-        with open(output_path, 'wb') as f:
-            f.write(header)
-            f.write(ciphertext)
-        
+
+        plaintext = input_path.read_bytes()
+        sha = self.engine.sha256(plaintext)
+        size = len(plaintext)
+        timestamp = int(time.time())
+
+        ext = input_path.suffix.encode('utf-8')
+        if len(ext) > MAX_EXT_LEN:
+            ext = b""
+
+        payload = zlib.compress(plaintext, level=9)
+        flags = FLAG_COMPRESSED
+        if len(payload) >= size:        # la compressione non conviene
+            payload = plaintext
+            flags = 0
+
+        def build_header(salt, nonce):
+            return struct.pack(HEADER_FMT, MAGIC, VERSION, ALGO_AES256GCM, flags,
+                               salt, nonce, timestamp, size, sha, len(ext)) + ext
+
+        blob = self.engine.seal(payload, password, build_header)
+        output_path.write_bytes(blob)
+
         return {
-            'input': str(input_path), 
+            'input': str(input_path),
             'output': str(output_path),
-            'size_original': len(plaintext), 
-            'size_encrypted': output_path.stat().st_size
+            'size_original': size,
+            'size_encrypted': len(blob)
         }
-    
+
     def decrypt(self, input_path, output_path, password):
         input_path = Path(input_path)
         output_path = Path(output_path)
-        
-        with open(input_path, 'rb') as f:
-            magic = f.read(len(MAGIC))
-            if magic != MAGIC:
-                raise ValueError("Invalid Crypton format")
-            
-            version = struct.unpack('<H', f.read(2))[0]
-            if version != VERSION:
-                raise ValueError(f"Unsupported version: {version}")
-            
-            original_size = struct.unpack('<Q', f.read(8))[0]
-            salt = f.read(SALT_SIZE)
-            if len(salt) != SALT_SIZE:
-                raise ValueError("Invalid salt size")
-            
-            nonce = f.read(NONCE_SIZE)
-            if len(nonce) != NONCE_SIZE:
-                raise ValueError("Invalid nonce size")
-            
-            note_len = struct.unpack('<H', f.read(2))[0]
-            if note_len != 0:
-                f.read(note_len)
-            
-            timestamp = struct.unpack('<Q', f.read(8))[0]
-            flags = f.read(1)[0]
-            compressed = bool(flags & 1 << 3)
-            
-            pos_before_hmac = f.tell()
-            stored_hmac = f.read(8)
-            
-            f.seek(0)
-            header_data = f.read(pos_before_hmac)
-            if hashlib.sha256(header_data).digest()[:8] != stored_hmac:
-                raise ValueError("Corrupt header")
-            
-            f.seek(pos_before_hmac + 8)
-            ciphertext = f.read()
-        
-        password_bytes = password.encode('utf-8')
-        key = self._derive_key(password_bytes, salt)
-        cipher = ChaCha20Poly1305(key)
-        
-        plaintext = cipher.decrypt(nonce, ciphertext, None)
-        if compressed:
-            plaintext = zlib.decompress(plaintext)
-        
-        with open(output_path, 'wb') as f:
-            f.write(plaintext)
-        
+
+        data = input_path.read_bytes()
+        plaintext, h = self._decrypt_bytes(data, password)
+
+        # Scrittura solo dopo che tutte le verifiche sono passate
+        output_path.write_bytes(plaintext)
         return {
-            'input': str(input_path), 
-            'output': str(output_path)
+            'input': str(input_path),
+            'output': str(output_path),
+            'size_original': h['size_original'],
+            'extension': h['extension'],
         }
-    
-    def verify(self, file_path):
+
+    def verify(self, file_path, password=None):
+        """Senza password: controllo strutturale dell'header.
+        Con password: verifica completa (HMAC, tag GCM, SHA-256 del plaintext), senza scrivere nulla."""
         file_path = Path(file_path)
-        with open(file_path, 'rb') as f:
-            magic = f.read(len(MAGIC))
-            if magic != MAGIC:
-                return {'valid': False, 'reason': 'Invalid magic'}
-            
-            version = struct.unpack('<H', f.read(2))[0]
-            if version != VERSION:
-                return {'valid': False, 'reason': f'Version: {version}'}
-            
-            original_size = struct.unpack('<Q', f.read(8))[0]
-            salt = f.read(SALT_SIZE)
-            nonce = f.read(NONCE_SIZE)
-            note_len = struct.unpack('<H', f.read(2))[0]
-            if note_len > 0:
-                f.read(note_len)
-            timestamp = struct.unpack('<Q', f.read(8))[0]
-            flags = f.read(1)[0]
-            pos_before_hmac = f.tell()
-            stored_hmac = f.read(8)
-            f.seek(0)
-            header_data = f.read(pos_before_hmac)
-            header_valid = hashlib.sha256(header_data).digest()[:8] == stored_hmac
-            
-            return {
-                'valid': header_valid,
-                'version': version,
-                'size_original': original_size,
-                'timestamp': timestamp,
-                'compressed': bool(flags & 1 << 3)
-            }
+        total = file_path.stat().st_size
+
+        if password:
+            data = file_path.read_bytes()
+            _plain, h = self._decrypt_bytes(data, password)
+            authenticated = True
+        else:
+            with open(file_path, 'rb') as f:
+                head = f.read(HEADER_FIXED_SIZE + MAX_EXT_LEN + MAC_SIZE)
+            h = self._parse(head, total)
+            authenticated = False
+
+        return {
+            'valid': True,
+            'authenticated': authenticated,
+            'version': h['version'],
+            'algorithm': h['algorithm'],
+            'size_original': h['size_original'],
+            'timestamp': h['timestamp'],
+            'compressed': h['compressed'],
+            'extension': h['extension'],
+        }
 
 
 # ============================================================================
 # STEGO CORE
 # ============================================================================
 class StegoCore:
-    """LSB/APPEND Steganography"""
-    
-    def _derive_key(self, password, salt=None):
-        if salt is None:
-            salt = os.urandom(16)
-        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200000)
-        return base64.urlsafe_b64encode(kdf.derive(password.encode())), salt
-    
-    def _encrypt_data(self, data, password):
-        key, salt = self._derive_key(password)
-        f = Fernet(key)
-        return salt + f.encrypt(data)
-    
-    def _decrypt_data(self, encrypted_data, password):
-        salt = encrypted_data[:16]
-        ciphertext = encrypted_data[16:]
-        key, _ = self._derive_key(password, salt)
-        f = Fernet(key)
-        return f.decrypt(ciphertext)
-    
-    def hide_lsb(self, image_path, file_path, output_path, password=None):
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        
-        if password:
-            encrypted_data = self._encrypt_data(file_data, password)
-            file_name = Path(file_path).name.encode('utf-8')
-            payload = STEGO_ENCRYPT_MARKER + struct.pack('>H', len(file_name)) + file_name + encrypted_data
+    """LSB/APPEND Steganography (payload cifrato con lo stesso motore dei file)"""
+
+    def __init__(self, engine=None):
+        self.engine = engine or CryptoEngine()
+
+    # ---- payload -----------------------------------------------------------
+    def build_payload(self, file_path, password=None):
+        file_path = Path(file_path)
+        name = file_path.name.encode('utf-8')
+        inner = struct.pack('>H', len(name)) + name + file_path.read_bytes()
+        if not password:
+            return inner
+
+        sha = self.engine.sha256(inner)
+
+        def build_header(salt, nonce):
+            return STEGO_ENCRYPT_MARKER + bytes([ALGO_AES256GCM]) + salt + nonce + sha
+
+        # Con la cifratura anche il nome del file resta nascosto
+        return self.engine.seal(inner, password, build_header)
+
+    def is_encrypted(self, payload):
+        return payload.startswith(STEGO_ENCRYPT_MARKER)
+
+    def process_payload(self, payload, password=None):
+        if self.is_encrypted(payload):
+            if not password:
+                raise CryptonError("Password required")
+            if len(payload) < STEGO_META_SIZE + MAC_SIZE + TAG_SIZE:
+                raise InvalidFormatError("Dati nascosti non validi")
+
+            idx = len(STEGO_ENCRYPT_MARKER)
+            algo = payload[idx]
+            if algo not in SUPPORTED_ALGORITHMS:
+                raise UnsupportedAlgorithmError()
+            idx += 1
+            salt = payload[idx:idx + SALT_SIZE]
+            idx += SALT_SIZE
+            nonce = payload[idx:idx + NONCE_SIZE]
+            idx += NONCE_SIZE
+            sha = payload[idx:idx + SHA_SIZE]
+
+            inner = self.engine.open(payload, STEGO_META_SIZE, password, salt, nonce)
+            if not hmac.compare_digest(self.engine.sha256(inner), sha):
+                raise IntegrityError()
         else:
-            file_name = Path(file_path).name.encode('utf-8')
-            payload = struct.pack('>H', len(file_name)) + file_name + file_data
-        
-        header = STEGO_MAGIC_LSB + struct.pack('>I', len(payload)) + payload
+            inner = payload
+
+        if len(inner) < 2:
+            raise InvalidFormatError("Dati nascosti non validi")
+        name_len = struct.unpack('>H', inner[:2])[0]
+        if 2 + name_len > len(inner):
+            raise InvalidFormatError("Dati nascosti non validi")
+        try:
+            file_name = inner[2:2 + name_len].decode('utf-8')
+        except UnicodeDecodeError:
+            raise InvalidFormatError("Dati nascosti non validi")
+        return file_name, inner[2 + name_len:]
+
+    # ---- LSB ---------------------------------------------------------------
+    @staticmethod
+    def _load_image(image_path):
         img = Image.open(image_path)
-        if img.mode in ('RGBA',):
-            img = img.convert('RGB')
         if img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
-        
-        pixels = list(img.getdata())
-        capacity = len(pixels) * (1 if img.mode == 'L' else 3)
-        if len(header) * 8 > capacity:
-            raise Exception(f"File too large. Max: {capacity//8} bytes")
-        
-        bits = []
-        for byte in header:
-            for i in range(7, -1, -1):
-                bits.append((byte >> i) & 1)
-        
-        new_pixels = []
-        bit_idx = 0
-        for pixel in pixels:
-            if img.mode == 'L':
-                if bit_idx < len(bits):
-                    new_pixels.append((pixel & 0xFE) | bits[bit_idx])
-                    bit_idx += 1
-                else:
-                    new_pixels.append(pixel)
-            else:
-                r, g, b = pixel[:3]
-                if bit_idx < len(bits):
-                    r = (r & 0xFE) | bits[bit_idx]
-                    bit_idx += 1
-                if bit_idx < len(bits):
-                    g = (g & 0xFE) | bits[bit_idx]
-                    bit_idx += 1
-                if bit_idx < len(bits):
-                    b = (b & 0xFE) | bits[bit_idx]
-                    bit_idx += 1
-                new_pixels.append((r, g, b))
-        
-        new_img = Image.new(img.mode, img.size)
-        new_img.putdata(new_pixels)
+        return img
+
+    def hide_lsb(self, image_path, file_path, output_path, password=None):
+        if Path(output_path).suffix.lower() not in LOSSLESS_EXTENSIONS:
+            raise ValueError("LSB requires a lossless output format (PNG, BMP or TIFF): "
+                             "JPEG/WEBP compression would destroy the hidden data")
+
+        payload = self.build_payload(file_path, password)
+        data = STEGO_MAGIC_LSB + struct.pack('>I', len(payload)) + payload
+
+        img = self._load_image(image_path)
+        raw = bytearray(img.tobytes())      # un byte per canale: R,G,B,R,G,B... (oppure L)
+        if len(data) * 8 > len(raw):
+            raise Exception(f"File too large. Max: {len(raw) // 8 - len(STEGO_MAGIC_LSB) - 4} bytes")
+
+        pos = 0
+        for byte in data:
+            for shift in range(7, -1, -1):
+                raw[pos] = (raw[pos] & 0xFE) | ((byte >> shift) & 1)
+                pos += 1
+
+        new_img = Image.frombytes(img.mode, img.size, bytes(raw))
         new_img.save(output_path)
         return True
-    
+
+    @staticmethod
+    def _read_lsb_bytes(raw, start, count):
+        out = bytearray(count)
+        pos = start * 8
+        for i in range(count):
+            b = 0
+            for k in range(8):
+                b = (b << 1) | (raw[pos + k] & 1)
+            out[i] = b
+            pos += 8
+        return bytes(out)
+
     def extract_lsb(self, image_path):
-        img = Image.open(image_path)
-        if img.mode in ('RGBA',):
-            img = img.convert('RGB')
-        if img.mode not in ('RGB', 'L'):
-            img = img.convert('RGB')
-        pixels = list(img.getdata())
-        bits = []
-        for pixel in pixels:
-            if img.mode == 'L':
-                bits.append(pixel & 1)
-            else:
-                bits.append(pixel[0] & 1)
-                bits.append(pixel[1] & 1)
-                bits.append(pixel[2] & 1)
-        data = bytearray()
-        for i in range(0, len(bits), 8):
-            byte = 0
-            for j in range(8):
-                if i + j < len(bits):
-                    byte = (byte << 1) | bits[i + j]
-                else:
-                    byte = byte << 1
-            data.append(byte)
-        data = bytes(data)
-        pos = data.find(STEGO_MAGIC_LSB)
-        if pos == -1:
+        raw = self._load_image(image_path).tobytes()
+        head_len = len(STEGO_MAGIC_LSB) + 4
+        if len(raw) < head_len * 8:
             return None
-        idx = pos + len(STEGO_MAGIC_LSB)
-        payload_len = struct.unpack('>I', data[idx:idx+4])[0]
-        idx += 4
-        return data[idx:idx+payload_len]
-    
+
+        # Il magic deve trovarsi esattamente all'inizio dei bit decodificati
+        head = self._read_lsb_bytes(raw, 0, head_len)
+        if head[:len(STEGO_MAGIC_LSB)] != STEGO_MAGIC_LSB:
+            return None
+
+        payload_len = struct.unpack('>I', head[len(STEGO_MAGIC_LSB):])[0]
+        if (head_len + payload_len) * 8 > len(raw):
+            return None
+        return self._read_lsb_bytes(raw, head_len, payload_len)
+
+    # ---- APPEND ------------------------------------------------------------
     def hide_append(self, image_path, file_path, output_path, password=None):
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        if password:
-            encrypted_data = self._encrypt_data(file_data, password)
-            file_name = Path(file_path).name.encode('utf-8')
-            payload = STEGO_ENCRYPT_MARKER + struct.pack('>H', len(file_name)) + file_name + encrypted_data
-        else:
-            file_name = Path(file_path).name.encode('utf-8')
-            payload = struct.pack('>H', len(file_name)) + file_name + file_data
-        with open(image_path, 'rb') as f:
-            image_data = f.read()
+        payload = self.build_payload(file_path, password)
+        image_data = Path(image_path).read_bytes()
         full_payload = STEGO_MAGIC_APP + struct.pack('>I', len(payload)) + payload + STEGO_END_APP
         with open(output_path, 'wb') as f:
             f.write(image_data)
             f.write(full_payload)
         return True
-    
+
     def extract_append(self, image_path):
-        with open(image_path, 'rb') as f:
-            data = f.read()
+        data = Path(image_path).read_bytes()
         start = data.find(STEGO_MAGIC_APP)
-        if start == -1:
-            return None
-        idx = start + len(STEGO_MAGIC_APP)
-        payload_len = struct.unpack('>I', data[idx:idx+4])[0]
-        idx += 4
-        return data[idx:idx+payload_len]
-    
-    def is_encrypted(self, payload):
-        return payload.startswith(STEGO_ENCRYPT_MARKER)
-    
-    def process_payload(self, payload, password=None):
-        if self.is_encrypted(payload):
-            if not password:
-                raise Exception("Password required")
-            idx = len(STEGO_ENCRYPT_MARKER)
-            name_len = struct.unpack('>H', payload[idx:idx+2])[0]
-            idx += 2
-            file_name = payload[idx:idx+name_len].decode('utf-8')
-            idx += name_len
-            return file_name, self._decrypt_data(payload[idx:], password)
-        else:
-            name_len = struct.unpack('>H', payload[:2])[0]
-            idx = 2
-            file_name = payload[idx:idx+name_len].decode('utf-8')
-            idx += name_len
-            return file_name, payload[idx:]
-    
+        while start != -1:
+            idx = start + len(STEGO_MAGIC_APP)
+            if idx + 4 <= len(data):
+                payload_len = struct.unpack('>I', data[idx:idx + 4])[0]
+                idx += 4
+                end = idx + payload_len
+                # Accetta solo se il marker di fine è esattamente dove deve essere
+                if data[end:end + len(STEGO_END_APP)] == STEGO_END_APP:
+                    return data[idx:end]
+            start = data.find(STEGO_MAGIC_APP, start + 1)
+        return None
+
+    # ---- output ------------------------------------------------------------
     def save_file(self, file_name, file_data, output_dir):
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        original = Path(file_name)
+        # Il nome arriva da dati esterni: tieni solo l'ultimo componente
+        original = Path(file_name.replace('\\', '/').split('/')[-1] or "extracted")
         path = out / f"{original.stem}_extracted{original.suffix}"
         counter = 1
         while path.exists():
@@ -537,7 +631,7 @@ class CryptonApp:
         
         self.pages = {}
         self.sidebar_items = {}
-        self.current_page = "stego"
+        self.current_page = "crypto"
         
         self._build_ui()
     
@@ -559,13 +653,13 @@ class CryptonApp:
         nav = ctk.CTkFrame(sidebar, fg_color="transparent")
         nav.pack(fill="x", padx=8)
         
-        btn_stego = SidebarButton(nav, "Steganography", lambda: self._select_page("stego"))
-        btn_stego.pack(fill="x", pady=2)
-        self.sidebar_items["stego"] = btn_stego
-        
         btn_crypto = SidebarButton(nav, "File Cryptography", lambda: self._select_page("crypto"))
         btn_crypto.pack(fill="x", pady=2)
         self.sidebar_items["crypto"] = btn_crypto
+        
+        btn_stego = SidebarButton(nav, "Steganography", lambda: self._select_page("stego"))
+        btn_stego.pack(fill="x", pady=2)
+        self.sidebar_items["stego"] = btn_stego
         
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.pack(side="bottom", fill="x", padx=16, pady=16)
@@ -576,7 +670,7 @@ class CryptonApp:
         
         self.pages["stego"] = self._build_stego_page(content)
         self.pages["crypto"] = self._build_crypto_page(content)
-        self._select_page("stego")
+        self._select_page("crypto")
     
     def _select_page(self, name):
         self.current_page = name
@@ -648,7 +742,7 @@ class CryptonApp:
         ctk.CTkRadioButton(method_frame, text="APPEND (End of file)", variable=self.hide_method_var, value="append", font=("Segoe UI", 12), fg_color=COLORS["accent"], text_color=COLORS["text"]).pack(side="left")
         
         self.use_encryption = ctk.BooleanVar(value=False)
-        ctk.CTkSwitch(hide_inner, text="Encrypt with AES-256", font=("Segoe UI", 12), variable=self.use_encryption, fg_color=COLORS["bg_tertiary"], progress_color=COLORS["accent"], text_color=COLORS["text"], command=self._toggle_stego_encryption).pack(anchor="w", pady=(0, 6))
+        ctk.CTkSwitch(hide_inner, text="Encrypt with AES-256-GCM", font=("Segoe UI", 12), variable=self.use_encryption, fg_color=COLORS["bg_tertiary"], progress_color=COLORS["accent"], text_color=COLORS["text"], command=self._toggle_stego_encryption).pack(anchor="w", pady=(0, 6))
         
         # Password row with Show button for Hide
         stego_pass_row = ctk.CTkFrame(hide_inner, fg_color="transparent")
@@ -754,7 +848,7 @@ class CryptonApp:
         container.pack(fill="both", expand=True, padx=SP_XS, pady=SP_XS)
         
         ctk.CTkLabel(container, text="File Cryptography", font=("Segoe UI", 24, "bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(0, 4))
-        ctk.CTkLabel(container, text="ChaCha20-Poly1305 + Argon2id - Secure file encryption", font=("Segoe UI", 13), text_color=COLORS["text_secondary"]).pack(anchor="w", pady=(0, 16))
+        ctk.CTkLabel(container, text="AES-256-GCM + Scrypt - Secure file encryption", font=("Segoe UI", 13), text_color=COLORS["text_secondary"]).pack(anchor="w", pady=(0, 16))
         
         main_card = self._card(container)
         main_card.pack(fill="both", expand=True)
@@ -900,6 +994,9 @@ class CryptonApp:
             messagebox.showinfo("Success", "File hidden successfully!")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+        finally:
+            password = None
+            self._clear_stego_password()
     
     def _do_extract(self):
         img = self.extract_image_var.get()
@@ -921,22 +1018,39 @@ class CryptonApp:
                 messagebox.showwarning("Warning", "No hidden file found")
                 return
             
-            if self.stego.is_encrypted(payload):
-                if not password:
-                    messagebox.showerror("Error", "Password required for encrypted file")
-                    return
-                try:
-                    file_name, file_data = self.stego.process_payload(payload, password)
-                except Exception as e:
-                    messagebox.showerror("Error", f"Wrong password or corrupted data: {str(e)}")
-                    return
-            else:
-                file_name, file_data = self.stego.process_payload(payload, None)
+            if self.stego.is_encrypted(payload) and not password:
+                messagebox.showerror("Error", "Password required for encrypted file")
+                return
             
+            file_name, file_data = self.stego.process_payload(payload, password or None)
             path = self.stego.save_file(file_name, file_data, out)
             messagebox.showinfo("Success", f"Extracted: {path.name}")
         except Exception as e:
+            # CryptonError porta già il messaggio specifico (password errata / integrità / algoritmo)
             messagebox.showerror("Error", str(e))
+        finally:
+            password = None
+            self._clear_extract_password()
+    
+    # ========================================================================
+    # PASSWORD CLEANUP
+    # ========================================================================
+    def _clear_crypto_password(self):
+        """Svuota i campi password della pagina Cryptography (entry + variabili)."""
+        self.pass_entry.delete(0, "end")
+        self.confirm_pass_entry.delete(0, "end")
+        self.password.set("")
+        self.confirm_password.set("")
+    
+    def _clear_stego_password(self):
+        """Svuota i campi password della sezione Hide."""
+        for entry in (self.stego_pass_entry, self.stego_confirm_entry):
+            entry.delete(0, "end")
+    
+    def _clear_extract_password(self):
+        """Svuota il campo password della sezione Extract (entry + variabile)."""
+        self.extract_pass_entry.delete(0, "end")
+        self.extract_password.set("")
     
     # ========================================================================
     # CRYPTO HELPERS
@@ -975,31 +1089,38 @@ class CryptonApp:
             info_text = f"{self.current_file.name} | {self._format_size(size)}"
             if self.current_file.suffix.lower() == '.crypton':
                 try:
-                    info = self.crypto.verify(self.current_file)
-                    if info['valid']:
-                        info_text += " | Valid Crypton file"
-                except:
+                    self.crypto.verify(self.current_file)
+                    info_text += " | Valid Crypton file"
+                except CryptonError as e:
+                    info_text += f" | {e}"
+                except Exception:
                     pass
             self.file_info_frame.pack(fill="x")
             self.file_info_label.configure(text=info_text)
             self.file_info_icon.configure(text="OK", text_color=COLORS["success"])
     
-    def _run_async(self, func, *args, **kwargs):
+    def _run_async(self, func, *args, fmt=None):
         self._set_buttons_enabled(False)
         
         def wrapper():
             try:
-                result = func(*args, **kwargs)
-                self.root.after(0, lambda: self._on_operation_done(result, True))
+                result = func(*args)
+                self.root.after(0, lambda: self._on_operation_done(result, True, fmt))
             except Exception as err:
-                error_msg = str(err)
-                self.root.after(0, lambda: self._on_operation_done(error_msg, False))
+                error_msg = str(err) or err.__class__.__name__
+                self.root.after(0, lambda: self._on_operation_done(error_msg, False, fmt))
         
         threading.Thread(target=wrapper, daemon=True).start()
     
-    def _on_operation_done(self, result, success):
+    def _on_operation_done(self, result, success, fmt=None):
         self._set_buttons_enabled(True)
-        if success and isinstance(result, dict):
+        # Dopo ogni operazione le password non devono restare nei campi
+        self._clear_crypto_password()
+        
+        if success and fmt is not None:
+            title, msg = fmt(result)
+            messagebox.showinfo(title, msg)
+        elif success and isinstance(result, dict):
             msg = "Success\n\n"
             msg += f"Input: {result.get('input', 'N/A')}\n"
             msg += f"Output: {result.get('output', 'N/A')}\n"
@@ -1028,6 +1149,8 @@ class CryptonApp:
         output = filedialog.asksaveasfilename(defaultextension=".crypton", initialfile=default, filetypes=[("Crypton files", "*.crypton"), ("All", "*.*")])
         if output:
             self._run_async(self.crypto.encrypt, self.current_file, Path(output), self.password.get())
+        else:
+            self._clear_crypto_password()
     
     def _decrypt(self):
         if not self.current_file:
@@ -1040,36 +1163,57 @@ class CryptonApp:
             messagebox.showerror("Error", "Enter the password")
             return
         
-        base_name = self.current_file.stem
+        # L'estensione originale è memorizzata nell'header: niente più deduzioni dal nome
+        try:
+            ext = self.crypto.verify(self.current_file)['extension']
+        except (CryptonError, OSError) as e:
+            messagebox.showerror("Error", str(e))
+            self._clear_crypto_password()
+            return
         
-        if '.' in base_name:
-            original_name = base_name.rsplit('.', 1)[0]
-            original_ext = '.' + base_name.rsplit('.', 1)[1]
-            default = f"{original_name}_decrypted{original_ext}"
-        else:
-            default = f"{base_name}_decrypted"
-        
+        default = f"{self.current_file.stem}_decrypted{ext}"
         output = filedialog.asksaveasfilename(
-            defaultextension="",
+            defaultextension=ext,
             initialfile=default,
             filetypes=[("All files", "*.*")]
         )
         if output:
             self._run_async(self.crypto.decrypt, self.current_file, Path(output), self.password.get())
+        else:
+            self._clear_crypto_password()
+    
+    @staticmethod
+    def _format_timestamp(ts):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except (OverflowError, OSError, ValueError):
+            return "N/A"
+    
+    def _format_verify(self, info):
+        if info['authenticated']:
+            msg = "Integrity verified: password, header, data and SHA-256 are all valid\n\n"
+        else:
+            msg = "Valid Crypton structure\n(enter the password for a full integrity check)\n\n"
+        msg += f"Version: {info['version']}\n"
+        msg += f"Algorithm: {info['algorithm']}\n"
+        msg += f"Original Size: {self._format_size(info['size_original'])}\n"
+        msg += f"Original Extension: {info['extension'] or '(none)'}\n"
+        msg += f"Compressed: {'yes' if info['compressed'] else 'no'}\n"
+        msg += f"Created: {self._format_timestamp(info['timestamp'])}"
+        return "Verify", msg
     
     def _verify(self):
         if not self.current_file:
             messagebox.showerror("Error", "Select a file")
             return
+        password = self.password.get()
+        if password:
+            # Verifica completa (scrypt + decifratura in memoria): fuori dal thread UI
+            self._run_async(self.crypto.verify, self.current_file, password, fmt=self._format_verify)
+            return
         try:
             info = self.crypto.verify(self.current_file)
-            if info['valid']:
-                msg = "Valid Crypton file\n\n"
-                msg += f"Version: {info['version']}\n"
-                msg += f"Original Size: {self._format_size(info['size_original'])}\n"
-                messagebox.showinfo("Verify", msg)
-            else:
-                messagebox.showerror("Error", "File is corrupt!")
+            messagebox.showinfo(*self._format_verify(info))
         except Exception as e:
             messagebox.showerror("Error", str(e))
     
@@ -1085,10 +1229,11 @@ class CryptonApp:
         if self.current_file.suffix.lower() == '.crypton':
             try:
                 cinfo = self.crypto.verify(self.current_file)
-                if cinfo['valid']:
-                    info += f"\n--- Crypton Metadata ---\n"
-                    info += f"Original: {self._format_size(cinfo['size_original'])}"
-            except:
+                info += "\n--- Crypton Metadata ---\n"
+                info += f"Algorithm: {cinfo['algorithm']}\n"
+                info += f"Original: {self._format_size(cinfo['size_original'])}\n"
+                info += f"Original Extension: {cinfo['extension'] or '(none)'}"
+            except Exception:
                 pass
         messagebox.showinfo("File Info", info)
     
