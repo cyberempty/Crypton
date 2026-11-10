@@ -38,15 +38,16 @@ One self-contained file. No installation, no dependencies, no traces left on you
 
 ## Downloads
 
-Each platform has its own **single-file launcher**. Download the one for your system and run it: it works even when copied on its own to another computer or a USB stick, offline, without the `source/` folder.
+Each platform has its own launcher. Download the one for your system and run it: it works even when copied on its own to another computer or a USB stick, offline, without the `source/` folder.
 
 | Platform | Launcher | Where it comes from | Status |
 |---|---|---|---|
 | Windows 10 / 11 (64-bit) | `Crypton-Windows.exe` | included in this repository | built and tested |
 | Linux (x86-64, glibc 2.17+) | `Crypton-Linux` | included in this repository | built and tested |
-| macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS` | build it on a Mac, see [Building from source](#building-from-source) | code type-checks for macOS; not yet tested on real hardware |
+| Linux, with icon in the file manager | `Crypton-Linux.AppImage` | included in this repository | packaged from `Crypton-Linux`, double-click to run |
+| macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS.zip` (contains `Crypton.app`) | built by GitHub Actions or on a Mac, see [Building from source](#building-from-source) | code type-checks for macOS; not yet tested on real hardware |
 
-The macOS launcher can only be built on a Mac, so it is not included.
+The macOS app can only be built on a Mac (or a macOS runner), so it is not included in the repository. The workflow in `.github/workflows/release.yml` builds all launchers: on GitHub open **Actions → Build launchers → Run workflow**.
 
 ## Features
 
@@ -228,42 +229,18 @@ Rename `target/.../release/crypton` to `Crypton-Linux`.
 macOS software can only be built on a Mac. From the `source/` folder:
 
 ```sh
-rustup target add x86_64-apple-darwin aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-lipo -create -output Crypton \
-  target/aarch64-apple-darwin/release/crypton \
-  target/x86_64-apple-darwin/release/crypton
+bash packaging/macos/bundle.sh
 ```
 
-`Crypton` is a universal binary (Intel and Apple Silicon) that you can already run from a terminal. To get a double-clickable app, wrap it in a bundle:
+The script builds Intel and Apple Silicon binaries, merges them into one universal binary, wraps it in `Crypton.app` with the icon and `Info.plist` from `packaging/macos/`, signs it ad-hoc and produces `dist/Crypton-macOS.zip`. Double-click `Crypton.app` to run it.
+
+### Linux: icon and application menu
+
+`Crypton-Linux` is a plain executable, so a file manager cannot show an icon for it. Two options in `source/packaging/linux/`:
 
 ```sh
-mkdir -p Crypton.app/Contents/MacOS Crypton.app/Contents/Resources
-cp Crypton Crypton.app/Contents/MacOS/Crypton
-
-mkdir AppIcon.iconset
-for s in 16 32 128 256; do sips -z $s $s assets/logo.png --out AppIcon.iconset/icon_${s}x${s}.png; done
-iconutil -c icns AppIcon.iconset -o Crypton.app/Contents/Resources/AppIcon.icns
-
-cat > Crypton.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>Crypton</string>
-  <key>CFBundleIdentifier</key><string>org.crypton.app</string>
-  <key>CFBundleExecutable</key><string>Crypton</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.0</string>
-  <key>LSMinimumSystemVersion</key><string>10.13</string>
-  <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-PLIST
-
-codesign --force --deep --sign - Crypton.app   # ad-hoc signature
+bash packaging/linux/appimage.sh path/to/crypton   # single file with icon: Crypton-Linux.AppImage
+bash packaging/linux/install.sh ../Crypton-Linux   # installs it in the application menu (no root)
 ```
 
 ## Project layout
@@ -272,12 +249,15 @@ codesign --force --deep --sign - Crypton.app   # ad-hoc signature
 Crypton/
 ├── Crypton-Windows.exe          single, self-contained launcher for Windows
 ├── Crypton-Linux                single, self-contained launcher for Linux
+├── Crypton-Linux.AppImage       the same launcher for Linux, with icon, double-click to run
 ├── README.md
 ├── LICENSE
 ├── images/                      screenshots used in this README
 │   ├── home-screen.png
 │   ├── encryption-screen.png
 │   └── steganography-screen.png
+├── .github/workflows/
+│   └── release.yml              builds the Windows, Linux and macOS launchers
 └── source/                      only needed by developers
     ├── Cargo.toml               project definition and dependencies
     ├── Cargo.lock               exact dependency versions (reproducible builds)
@@ -285,6 +265,9 @@ Crypton/
     ├── assets/
     │   ├── logo.png             logo shown in the app and used as window icon
     │   └── icon.ico             multi-size icon of the Windows executable
+    ├── packaging/
+    │   ├── macos/               bundle.sh, Info.plist, icon.icns: builds Crypton.app
+    │   └── linux/               appimage.sh, install.sh, crypton.desktop, crypton.png
     └── src/
         ├── main.rs              entry point and memory-wiping allocator
         ├── gui.rs               interface (egui): screens, widgets, notifications
@@ -294,7 +277,7 @@ Crypton/
         └── util.rs              errors, progress, secure buffers, safe file names
 ```
 
-The macOS launcher is not part of the tree: it has to be built on a Mac.
+The macOS app is not part of the tree: it has to be built on a Mac or with the GitHub workflow.
 
 ## Dependencies
 

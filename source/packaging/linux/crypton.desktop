@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Crypton
+Comment=File encryption and steganography
+Exec=crypton
+Icon=crypton
+Terminal=false
+Categories=Utility;Security;
+StartupWMClass=crypton
