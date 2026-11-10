@@ -106,7 +106,7 @@ pub fn info_file(input: &Path, password: Option<&[u8]>) -> Result<String> {
         let mut out = String::new();
         out += "Type: Crypton encrypted file\n";
         out += &format!("Size: {}\n", fmt_size(len));
-        out += "Cipher: ChaCha20-Poly1305 (authenticated)\n";
+        out += "Cipher: AES-256-GCM + ChaCha20-Poly1305 (cascade, authenticated)\n";
         out += &format!(
             "Key derivation: Argon2id ({} MiB, {} passes, {} lanes)\n",
             h.m_kib / 1024,
@@ -134,5 +134,97 @@ pub fn info_file(input: &Path, password: Option<&[u8]>) -> Result<String> {
     match stego::inspect(&bytes) {
         Some(text) => Ok(format!("Type: image with hidden content\nImage size: {}\n{}", fmt_size(len), text)),
         None => Err(E::InvalidFile),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("crypton-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x = 5u32;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn real_files_encrypt_verify_info_decrypt() {
+        let d = tmp("ops");
+        let p = Progress::new();
+        let data = noise(150_000);
+        let src = d.join("note.bin");
+        fs::write(&src, &data).unwrap();
+        let enc = d.join("note.bin.crypton");
+
+        encrypt_file(&src, &enc, b"pw", &p).unwrap();
+        assert!(encrypt_file(&src, &src, b"pw", &p).is_err(), "must refuse to overwrite the source");
+        assert!(matches!(prepare_decrypt(&enc, b"bad", &p), Err(E::WrongPasswordOrCorrupted)));
+
+        let prep = prepare_decrypt(&enc, b"pw", &p).unwrap();
+        assert_eq!(prep.suggested_name, "note.bin");
+        let out = d.join("restored.bin");
+        finish_decrypt(&prep, &out, &p).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), data);
+
+        assert!(verify_file(&enc, None, &p).unwrap().contains("valid"));
+        assert!(verify_file(&enc, Some(b"pw"), &p).unwrap().contains("passed"));
+        let info = info_file(&enc, Some(b"pw")).unwrap();
+        assert!(info.contains("note.bin") && info.contains("AES-256-GCM"));
+
+        // a modified file is rejected and nothing is written
+        let mut raw = fs::read(&enc).unwrap();
+        let i = raw.len() / 2;
+        raw[i] ^= 1;
+        let bad = d.join("bad.crypton");
+        fs::write(&bad, &raw).unwrap();
+        assert!(matches!(prepare_decrypt(&bad, b"pw", &p), Err(E::IntegrityCompromised)));
+        let leftovers: Vec<_> = fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".part")).collect();
+        assert!(leftovers.is_empty(), "no temporary files may remain");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn real_files_steganography_both_methods() {
+        use image::{DynamicImage, ImageFormat};
+        let d = tmp("stego");
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(120, 90, |x, y| image::Rgb([(x * 2) as u8, (y * 2) as u8, (x + y) as u8])));
+        let cover = d.join("cover.png");
+        img.save_with_format(&cover, ImageFormat::Png).unwrap();
+        let secret = d.join("secret.txt");
+        fs::write(&secret, b"top secret").unwrap();
+        let dest = d.join("out");
+        fs::create_dir_all(&dest).unwrap();
+
+        for (i, pixels) in [true, false].into_iter().enumerate() {
+            let out = d.join(format!("hidden{i}.png"));
+            let written = if pixels {
+                stego::hide_pixels(&secret, &cover, &out, Some(b"pw")).unwrap()
+            } else {
+                stego::hide_tail(&secret, &cover, &out, Some(b"pw")).unwrap()
+            };
+            assert!(matches!(stego::extract_to_memory(&written, None), Err(E::PasswordRequired)));
+            assert!(stego::extract_to_memory(&written, Some(b"nope")).is_err());
+            let ex = stego::extract_to_memory(&written, Some(b"pw")).unwrap();
+            assert_eq!(ex.name, "secret.txt");
+            assert_eq!(&ex.data[..], b"top secret");
+            let saved = stego::write_extracted(&ex, &dest).unwrap();
+            assert_eq!(fs::read(&saved).unwrap(), b"top secret");
+            assert_eq!(saved.parent().unwrap(), dest);
+        }
+        // the second extraction did not overwrite the first
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
+        fs::remove_dir_all(&d).ok();
     }
 }
