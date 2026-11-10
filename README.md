@@ -47,8 +47,6 @@ Each platform has its own launcher. Download the one for your system and run it:
 | Linux, with icon in the file manager | `Crypton-Linux.AppImage` |
 | macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS.zip` (contains `Crypton.app`) |
 
-The macOS app can only be built on a Mac (or a macOS runner), so it is not included in the repository. The workflow in `.github/workflows/release.yml` builds all launchers: on GitHub open **Actions → Build launchers → Run workflow**.
-
 ## Features
 
 **Encryption**
