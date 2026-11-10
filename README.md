@@ -40,12 +40,12 @@ One self-contained file. No installation, no dependencies, no traces left on you
 
 Each platform has its own launcher. Download the one for your system and run it: it works even when copied on its own to another computer or a USB stick, offline, without the `source/` folder.
 
-| Platform | Launcher | Where it comes from | Status |
+| Platform | Launcher |
 |---|---|---|---|
-| Windows 10 / 11 (64-bit) | `Crypton-Windows.exe` | included in this repository | built and tested |
-| Linux (x86-64, glibc 2.17+) | `Crypton-Linux` | included in this repository | built and tested |
-| Linux, with icon in the file manager | `Crypton-Linux.AppImage` | included in this repository | packaged from `Crypton-Linux`, double-click to run |
-| macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS.zip` (contains `Crypton.app`) | built by GitHub Actions or on a Mac, see [Building from source](#building-from-source) | code type-checks for macOS; not yet tested on real hardware |
+| Windows 10 / 11 (64-bit) | `Crypton-Windows.exe` |
+| Linux (x86-64, glibc 2.17+) | `Crypton-Linux` |
+| Linux, with icon in the file manager | `Crypton-Linux.AppImage` |
+| macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS.zip` (contains `Crypton.app`) |
 
 The macOS app can only be built on a Mac (or a macOS runner), so it is not included in the repository. The workflow in `.github/workflows/release.yml` builds all launchers: on GitHub open **Actions → Build launchers → Run workflow**.
 
