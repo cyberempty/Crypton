@@ -41,7 +41,7 @@ One self-contained file. No installation, no dependencies, no traces left on you
 Each platform has its own launcher. Download the one for your system and run it: it works even when copied on its own to another computer or a USB stick, offline, without the `source/` folder.
 
 | Platform | Launcher |
-|---|---|---|---|
+|----------|----------|
 | Windows 10 / 11 (64-bit) | `Crypton-Windows.exe` |
 | Linux (x86-64, glibc 2.17+) | `Crypton-Linux` |
 | Linux, with icon in the file manager | `Crypton-Linux.AppImage` |
