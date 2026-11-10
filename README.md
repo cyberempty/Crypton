@@ -180,7 +180,13 @@ Virtual machines and remote desktops without 3D acceleration may not provide Ope
 xattr -dr com.apple.quarantine Crypton.app
 ```
 
-**Linux.** If the file lost its executable bit: `chmod +x Crypton-Linux`.
+**Linux.** If the file lost its executable bit: 
+`
+chmod +x Crypton-Linux.AppImage
+./Crypton-Linux.AppImage --appimage-extract
+chmod +x squashfs-root/usr/bin/crypton
+./squashfs-root/AppRun
+`.
 
 ## Building from source
 
