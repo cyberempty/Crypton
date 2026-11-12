@@ -146,7 +146,6 @@ fn logo_rgba() -> Option<(Vec<u8>, u32, u32)> {
 pub fn run() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Crypton")
-        .with_app_id("crypton")
         .with_inner_size([560.0, 800.0])
         .with_resizable(false)
         .with_maximize_button(false);

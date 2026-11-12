@@ -9,22 +9,6 @@ One self-contained file. No installation, no dependencies, no traces left on you
 
 ---
 
-## Contents
-
-- [Screenshots](#screenshots)
-- [Downloads](#downloads)
-- [Features](#features)
-- [How to use it](#how-to-use-it)
-- [Notifications](#notifications)
-- [Security](#security)
-- [File formats](#file-formats)
-- [Limitations](#limitations)
-- [System requirements](#system-requirements)
-- [Building from source](#building-from-source)
-- [Project layout](#project-layout)
-- [Dependencies](#dependencies)
-- [License](#license)
-
 ## Screenshots
 
 <p align="center">
@@ -35,17 +19,6 @@ One self-contained file. No installation, no dependencies, no traces left on you
   <img src="images/steganography-screen.png" width="250" alt="Steganography screen: extract a hidden file from an image">
 </p>
 <p align="center"><sub>Start screen &nbsp;·&nbsp; Encryption &nbsp;·&nbsp; Steganography</sub></p>
-
-## Downloads
-
-Each platform has its own launcher. Download the one for your system and run it: it works even when copied on its own to another computer or a USB stick, offline, without the `source/` folder.
-
-| Platform | Launcher |
-|----------|----------|
-| Windows 10 / 11 (64-bit) | `Crypton-Windows.exe` |
-| Linux (x86-64, glibc 2.17+) | `Crypton-Linux` |
-| Linux, with icon in the file manager | `Crypton-Linux.AppImage` |
-| macOS 10.13+ (Intel and Apple Silicon) | `Crypton-macOS.zip` (contains `Crypton.app`) |
 
 ## Features
 
@@ -64,7 +37,7 @@ Each platform has its own launcher. Download the one for your system and run it:
 
 **Interface**
 - Dark, minimal, fixed-size window with numbered steps, colored action buttons and a notification system.
-- Same look and behavior on Windows, Linux and macOS.
+- Same look and behavior on Windows and Linux.
 
 ## How to use it
 
@@ -169,24 +142,12 @@ Please read these before trusting Crypton with something important.
 |---|---|
 | **Windows** | Windows 10 or later, 64-bit; graphics driver with OpenGL 2.0 |
 | **Linux** | x86-64, glibc 2.17 or newer (any distribution from 2012 on); X11 or Wayland; OpenGL 2.0 (Mesa or vendor driver). The **Browse** dialogs use the desktop's `xdg-desktop-portal`; if it is missing, paste file paths into the fields instead |
-| **macOS** | macOS 10.13 or later, Intel or Apple Silicon |
+| **Linux ARM64** | same as Linux x86-64, on a 64-bit ARM processor |
 | **All** | about 300 MB of free memory while encrypting or decrypting (Argon2id uses 256 MiB); the launcher itself is 6-9 MB |
 
 Virtual machines and remote desktops without 3D acceleration may not provide OpenGL 2.0.
 
-**macOS first launch.** An app you did not build yourself is not notarized, so macOS may block it the first time. Right-click it → **Open** → **Open**, or run:
-
-```sh
-xattr -dr com.apple.quarantine Crypton.app
-```
-
-**Linux.** If the file lost its executable bit: 
-`
-chmod +x Crypton-Linux.AppImage
-./Crypton-Linux.AppImage --appimage-extract
-chmod +x squashfs-root/usr/bin/crypton
-./squashfs-root/AppRun
-`.
+**Linux.** If the file lost its executable bit: `chmod +x Crypton-Linux`.
 
 ## Building from source
 
@@ -226,42 +187,21 @@ pip install ziglang && cargo install cargo-zigbuild
 cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 ```
 
-Rename `target/.../release/crypton` to `Crypton-Linux`.
-
-### macOS
-
-macOS software can only be built on a Mac. From the `source/` folder:
-
-```sh
-bash packaging/macos/bundle.sh
-```
-
-The script builds Intel and Apple Silicon binaries, merges them into one universal binary, wraps it in `Crypton.app` with the icon and `Info.plist` from `packaging/macos/`, signs it ad-hoc and produces `dist/Crypton-macOS.zip`. Double-click `Crypton.app` to run it.
-
-### Linux: icon and application menu
-
-`Crypton-Linux` is a plain executable, so a file manager cannot show an icon for it. Two options in `source/packaging/linux/`:
-
-```sh
-bash packaging/linux/appimage.sh path/to/crypton   # single file with icon: Crypton-Linux.AppImage
-bash packaging/linux/install.sh ../Crypton-Linux   # installs it in the application menu (no root)
-```
+Rename `target/.../release/crypton` to `Crypton-Linux`. For 64-bit ARM Linux use the same command with `--target aarch64-unknown-linux-gnu.2.17` (after `rustup target add aarch64-unknown-linux-gnu`) and name the result `Crypton-Linux-arm64`.
 
 ## Project layout
 
 ```
 Crypton/
 ├── Crypton-Windows.exe          single, self-contained launcher for Windows
-├── Crypton-Linux                single, self-contained launcher for Linux
-├── Crypton-Linux.AppImage       the same launcher for Linux, with icon, double-click to run
+├── Crypton-Linux                single, self-contained launcher for Linux (x86-64)
+├── Crypton-Linux-arm64          single, self-contained launcher for Linux (ARM64)
 ├── README.md
 ├── LICENSE
 ├── images/                      screenshots used in this README
 │   ├── home-screen.png
 │   ├── encryption-screen.png
 │   └── steganography-screen.png
-├── .github/workflows/
-│   └── release.yml              builds the Windows, Linux and macOS launchers
 └── source/                      only needed by developers
     ├── Cargo.toml               project definition and dependencies
     ├── Cargo.lock               exact dependency versions (reproducible builds)
@@ -269,9 +209,6 @@ Crypton/
     ├── assets/
     │   ├── logo.png             logo shown in the app and used as window icon
     │   └── icon.ico             multi-size icon of the Windows executable
-    ├── packaging/
-    │   ├── macos/               bundle.sh, Info.plist, icon.icns: builds Crypton.app
-    │   └── linux/               appimage.sh, install.sh, crypton.desktop, crypton.png
     └── src/
         ├── main.rs              entry point and memory-wiping allocator
         ├── gui.rs               interface (egui): screens, widgets, notifications
@@ -280,8 +217,6 @@ Crypton/
         ├── ops.rs               file operations: encrypt, decrypt, verify, info
         └── util.rs              errors, progress, secure buffers, safe file names
 ```
-
-The macOS app is not part of the tree: it has to be built on a Mac or with the GitHub workflow.
 
 ## Dependencies
 
