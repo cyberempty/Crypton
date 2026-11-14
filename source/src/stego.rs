@@ -11,6 +11,7 @@
 //!   by its length and a marker. Image viewers ignore trailing data.
 
 use crate::crypto;
+use crate::folder;
 use crate::util::{message, random_upto, same_file, sanitize_name, unique_path, write_atomic, CryptonError as E, Progress, Result, ZVec};
 use image::{DynamicImage, ImageFormat};
 use std::fs;
@@ -43,6 +44,13 @@ pub struct Extracted {
     pub name: String,
     pub data: Zeroizing<Vec<u8>>,
     pub method: Method,
+}
+
+impl Extracted {
+    /// The hidden content is a whole folder, not a single file.
+    pub fn is_folder(&self) -> bool {
+        folder::is_folder_data(&self.data)
+    }
 }
 
 // ---------------------------------------------------------------- payload
@@ -254,7 +262,8 @@ pub fn inspect(bytes: &[u8]) -> Option<String> {
         0 => {
             s += "Password protected: no\n";
             if let Ok((name, data)) = unpack(&p, None) {
-                s += &format!("Hidden file name: {name}\nSize: {} bytes\n", data.len());
+                let what = if folder::is_folder_data(&data) { "folder" } else { "file" };
+                s += &format!("Hidden {what} name: {name}\nSize: {} bytes\n", data.len());
             }
         }
         1 => s += "Password protected: yes (name and content encrypted)\n",
@@ -277,13 +286,25 @@ fn secret_name(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into())
 }
 
-/// Hides `secret` in the pixels of `image`. Returns the path written.
-pub fn hide_pixels(secret: &Path, image: &Path, out: &Path, password: Option<&[u8]>) -> Result<PathBuf> {
+/// Reads what has to be hidden: a file, or a whole folder packed into one archive.
+/// Returns the name, the bytes and how many links were skipped (folders only).
+fn load_secret(secret: &Path) -> Result<(String, Zeroizing<Vec<u8>>, u64)> {
+    if secret.is_dir() {
+        let (data, skipped) = folder::pack_to_memory(secret, MAX_FILE)?;
+        Ok((secret_name(secret), data, skipped))
+    } else {
+        Ok((secret_name(secret), read_limited(secret, "The file to hide")?, 0))
+    }
+}
+
+/// Hides `secret` (a file or a folder) in the pixels of `image`.
+/// Returns the path written and the number of skipped links.
+pub fn hide_pixels(secret: &Path, image: &Path, out: &Path, password: Option<&[u8]>) -> Result<(PathBuf, u64)> {
     if same_file(image, out) || same_file(secret, out) {
         return message("Choose a name different from the source files.");
     }
-    let data = read_limited(secret, "The file to hide")?;
-    let payload = pack(&secret_name(secret), &data, password)?;
+    let (name, data, skipped) = load_secret(secret)?;
+    let payload = pack(&name, &data, password)?;
     drop(data);
     let img_bytes = read_limited(image, "The image")?;
     let (mut buf, w, h, ch) = load_pixels(&img_bytes)?;
@@ -298,21 +319,22 @@ pub fn hide_pixels(secret: &Path, image: &Path, out: &Path, password: Option<&[u
     };
     let encoded = encode_pixels(buf, w, h, ch, fmt)?;
     write_atomic(&final_path, |w| Ok(w.write_all(&encoded)?))?;
-    Ok(final_path)
+    Ok((final_path, skipped))
 }
 
-/// Hides `secret` at the end of the image file.
-pub fn hide_tail(secret: &Path, image: &Path, out: &Path, password: Option<&[u8]>) -> Result<PathBuf> {
+/// Hides `secret` (a file or a folder) at the end of the image file.
+/// Returns the path written and the number of skipped links.
+pub fn hide_tail(secret: &Path, image: &Path, out: &Path, password: Option<&[u8]>) -> Result<(PathBuf, u64)> {
     if same_file(image, out) || same_file(secret, out) {
         return message("Choose a name different from the source files.");
     }
-    let data = read_limited(secret, "The file to hide")?;
-    let payload = pack(&secret_name(secret), &data, password)?;
+    let (name, data, skipped) = load_secret(secret)?;
+    let payload = pack(&name, &data, password)?;
     drop(data);
     let img_bytes = read_limited(image, "The image")?;
     let combined = append_tail(&img_bytes, &payload)?;
     write_atomic(out, |w| Ok(w.write_all(&combined)?))?;
-    Ok(out.to_path_buf())
+    Ok((out.to_path_buf(), skipped))
 }
 
 /// Finds and opens the hidden content (every check happens here, in memory).
@@ -323,9 +345,13 @@ pub fn extract_to_memory(image: &Path, password: Option<&[u8]>) -> Result<Extrac
     Ok(Extracted { name, data, method })
 }
 
-/// Writes the extracted file inside `dir`, never outside it and never overwriting.
+/// Writes the extracted file (or rebuilds the extracted folder) inside `dir`,
+/// never outside it and never overwriting anything.
 pub fn write_extracted(ex: &Extracted, dir: &Path) -> Result<PathBuf> {
     let name = sanitize_name(&ex.name);
+    if ex.is_folder() {
+        return folder::extract_slice(&ex.data, dir, &name);
+    }
     let target = unique_path(dir, &name)?;
     if target.parent() != Some(dir) || target.file_name().is_none() {
         return message("Unsafe hidden file name: extraction cancelled.");

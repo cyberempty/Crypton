@@ -293,6 +293,32 @@ fn path_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) -> bo
     clicked
 }
 
+/// Like `path_row`, but with two buttons: 1 = pick a file, 2 = pick a folder, 0 = none.
+fn path_row_dual(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) -> u8 {
+    field_label(ui, label);
+    let mut picked = 0u8;
+    ui.horizontal(|ui| {
+        let bw = 118.0;
+        let tw = (ui.available_width() - 2.0 * bw - 2.0 * ui.spacing().item_spacing.x).max(60.0);
+        ui.add_sized([tw, 38.0], egui::TextEdit::singleline(text).hint_text(hint).align(Align2::LEFT_CENTER));
+        if button(ui, vec2(bw, 38.0), "Browse file", Tone::Neutral).clicked() {
+            picked = 1;
+        }
+        if button(ui, vec2(bw, 38.0), "Browse folder", Tone::Neutral).clicked() {
+            picked = 2;
+        }
+    });
+    picked
+}
+
+fn skipped_note(n: u64) -> String {
+    match n {
+        0 => String::new(),
+        1 => "\n1 symbolic link was skipped.".into(),
+        n => format!("\n{n} symbolic links were skipped."),
+    }
+}
+
 /// Password field (with "Show") and, if requested, the confirmation field.
 fn password_block(ui: &mut egui::Ui, label: &str, pw: &mut String, confirm: Option<&mut String>, show: &mut bool) {
     field_label(ui, label);
@@ -568,8 +594,27 @@ impl App {
             return None;
         }
         let p = PathBuf::from(t);
+        if p.is_dir() {
+            self.fail(&format!("{what}: this is a folder, choose a file."));
+            return None;
+        }
         if !p.is_file() {
             self.fail(&format!("{what}: the file does not exist."));
+            return None;
+        }
+        Some(p)
+    }
+
+    /// Like `existing_file`, but a folder is accepted too.
+    fn existing_path(&mut self, text: &str, what: &str) -> Option<PathBuf> {
+        let t = text.trim();
+        if t.is_empty() {
+            self.fail(&format!("{what}: choose a file or a folder."));
+            return None;
+        }
+        let p = PathBuf::from(t);
+        if !p.is_file() && !p.is_dir() {
+            self.fail(&format!("{what}: the file or folder does not exist."));
             return None;
         }
         Some(p)
@@ -604,7 +649,7 @@ impl App {
     // ------------------------------------------------------------ encryption
 
     fn encrypt(&mut self, ctx: &egui::Context) {
-        let Some(input) = self.existing_file(&self.c_file.clone(), "File to encrypt") else { return };
+        let Some(input) = self.existing_path(&self.c_file.clone(), "Item to encrypt") else { return };
         if self.c_pw.is_empty() {
             return self.fail("Enter a password.");
         }
@@ -613,9 +658,14 @@ impl App {
         }
         let weak = self.c_pw.clone();
         self.weak_password_warning(&weak);
+        let is_dir = input.is_dir();
+        let base = match file_name(&input) {
+            n if n.is_empty() => "folder".to_string(),
+            n => n,
+        };
         let mut dlg = rfd::FileDialog::new()
-            .set_title("Save the encrypted file")
-            .set_file_name(format!("{}.{}", file_name(&input), crate::crypto::EXTENSION))
+            .set_title(if is_dir { "Save the encrypted folder" } else { "Save the encrypted file" })
+            .set_file_name(format!("{base}.{}", crate::crypto::EXTENSION))
             .add_filter("Crypton file", &[crate::crypto::EXTENSION]);
         if let Some(d) = input.parent() {
             dlg = dlg.set_directory(d);
@@ -627,10 +677,10 @@ impl App {
         self.notify(Kind::Info, "Encryption started", file_name(&input));
         self.spawn(ctx, "Encrypting…", move |p| {
             let t0 = Instant::now();
-            match ops::encrypt_file(&input, &output, &pw, p) {
-                Ok(()) => Msg::Success {
-                    title: "File encrypted".into(),
-                    text: format!("Saved to: {}\nDone in {}.", output.display(), took(t0)),
+            match ops::encrypt_path(&input, &output, &pw, p) {
+                Ok(skipped) => Msg::Success {
+                    title: if is_dir { "Folder encrypted" } else { "File encrypted" }.into(),
+                    text: format!("Saved to: {}\nDone in {}.{}", output.display(), took(t0), skipped_note(skipped)),
                 },
                 Err(e) => Msg::Failed(e),
             }
@@ -695,7 +745,7 @@ impl App {
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
-        let Some(secret) = self.existing_file(&self.h_secret.clone(), "File to hide") else { return };
+        let Some(secret) = self.existing_path(&self.h_secret.clone(), "Item to hide") else { return };
         let Some(image) = self.existing_file(&self.h_cover.clone(), "Cover image") else { return };
         if self.h_out.trim().is_empty() {
             return self.fail("Choose where to save the image with the hidden file.");
@@ -720,19 +770,20 @@ impl App {
             self.weak_password_warning(&weak);
             Some(pw_bytes(&self.h_pw))
         } else {
-            self.notify(Kind::Warning, "Not protected", "Anyone who has this image will be able to extract the hidden file.");
+            self.notify(Kind::Warning, "Not protected", "Anyone who has this image will be able to extract the hidden content.");
             None
         };
         let pixels = self.h_pixels;
+        let is_dir = secret.is_dir();
         self.notify(Kind::Info, "Hiding started", file_name(&secret));
         self.spawn(ctx, "Hiding the file…", move |_| {
             let t0 = Instant::now();
             let pw = password.as_ref().map(|z| z.as_slice());
             let r = if pixels { stego::hide_pixels(&secret, &image, &out, pw) } else { stego::hide_tail(&secret, &image, &out, pw) };
             match r {
-                Ok(path) => Msg::Success {
-                    title: "File hidden".into(),
-                    text: format!("Image saved to: {}\nDone in {}.", path.display(), took(t0)),
+                Ok((path, skipped)) => Msg::Success {
+                    title: if is_dir { "Folder hidden" } else { "File hidden" }.into(),
+                    text: format!("Image saved to: {}\nDone in {}.{}", path.display(), took(t0), skipped_note(skipped)),
                 },
                 Err(e) => Msg::Failed(e),
             }
@@ -772,6 +823,28 @@ impl App {
             }
             Msg::DecryptReady(prep) => {
                 self.notify(Kind::Success, "Integrity verified", "The password is correct and all data is authentic.");
+                if prep.is_folder {
+                    let mut dlg = rfd::FileDialog::new().set_title("Choose where to restore the folder");
+                    if let Some(d) = prep.input.parent() {
+                        dlg = dlg.set_directory(d);
+                    }
+                    match dlg.pick_folder() {
+                        Some(dest) => {
+                            self.spawn(ctx, "Restoring the folder…", move |p| {
+                                let t0 = Instant::now();
+                                match ops::finish_decrypt_folder(&prep, &dest, p) {
+                                    Ok(path) => Msg::Success {
+                                        title: "Folder decrypted".into(),
+                                        text: format!("Restored to: {}\nDone in {}.", path.display(), took(t0)),
+                                    },
+                                    Err(e) => Msg::Failed(e),
+                                }
+                            });
+                        }
+                        None => self.notify(Kind::Warning, "Decryption cancelled", "Nothing was written to disk."),
+                    }
+                    return;
+                }
                 let mut dlg = rfd::FileDialog::new()
                     .set_title("Save the decrypted file")
                     .set_file_name(prep.suggested_name.clone());
@@ -798,8 +871,12 @@ impl App {
                 let dir = PathBuf::from(self.x_dir.trim());
                 let how = ex.method.label();
                 self.notify(Kind::Info, "Hidden content found", format!("Method: {how}."));
-                self.spawn(ctx, "Writing the extracted file…", move |_| match stego::write_extracted(&ex, &dir) {
-                    Ok(p) => Msg::Success { title: "File extracted".into(), text: format!("Saved to: {}", p.display()) },
+                let label = if ex.is_folder() { "Restoring the extracted folder…" } else { "Writing the extracted file…" };
+                self.spawn(ctx, label, move |_| match stego::write_extracted(&ex, &dir) {
+                    Ok(p) => Msg::Success {
+                        title: if p.is_dir() { "Folder extracted" } else { "File extracted" }.into(),
+                        text: format!("Saved to: {}", p.display()),
+                    },
                     Err(e) => Msg::Failed(e),
                 });
             }
@@ -821,17 +898,17 @@ impl App {
             self.logo_image(ui, 112.0);
             ui.add_space(4.0);
             ui.label(RichText::new("Crypton").size(42.0).strong().color(Color32::WHITE));
-            ui.label(RichText::new("Encrypt your files and hide them inside images.").size(15.0).color(MUTED));
+            ui.label(RichText::new("Encrypt your files and folders and hide them inside images.").size(15.0).color(MUTED));
             ui.add_space(26.0);
-            if home_card(ui, "Encryption", "Encrypt, decrypt and verify any file with a password.", Tone::Blue, Icon::Lock).clicked() {
+            if home_card(ui, "Encryption", "Encrypt, decrypt and verify files or folders.", Tone::Blue, Icon::Lock).clicked() {
                 self.open(Screen::Crypto);
             }
             ui.add_space(6.0);
-            if home_card(ui, "Steganography", "Hide a file inside an image, or extract one from it.", Tone::Violet, Icon::Image).clicked() {
+            if home_card(ui, "Steganography", "Hide files or folders inside an image, or extract them.", Tone::Violet, Icon::Image).clicked() {
                 self.open(Screen::Stego);
             }
             ui.add_space(20.0);
-            ui.label(RichText::new("AES-256 + ChaCha20  •  Argon2id  •  Open source (MIT)").size(12.0).color(MUTED));
+            ui.label(RichText::new(format!("Version {}  •  AES-256 + ChaCha20  •  Argon2id  •  Open source (MIT)", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
         });
     }
 
@@ -896,12 +973,21 @@ impl App {
         self.header(ui, "Encryption", "AES-256-GCM + ChaCha20-Poly1305 + Argon2id");
         card(ui, |ui| {
             ui.add_enabled_ui(!self.busy, |ui| {
-                step(ui, 1, "Choose a file", "");
-                if path_row(ui, "", &mut self.c_file, "Choose a file or paste its path") {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Choose the file").pick_file() {
-                        self.c_file = p.to_string_lossy().into_owned();
-                        self.picked("File selected", &p);
+                step(ui, 1, "Choose a file or folder", "to decrypt, choose the .crypton file");
+                match path_row_dual(ui, "", &mut self.c_file, "Choose a file or folder, or paste its path") {
+                    1 => {
+                        if let Some(p) = rfd::FileDialog::new().set_title("Choose the file").pick_file() {
+                            self.c_file = p.to_string_lossy().into_owned();
+                            self.picked("File selected", &p);
+                        }
                     }
+                    2 => {
+                        if let Some(p) = rfd::FileDialog::new().set_title("Choose the folder").pick_folder() {
+                            self.c_file = p.to_string_lossy().into_owned();
+                            self.picked("Folder selected", &p);
+                        }
+                    }
+                    _ => {}
                 }
                 divider(ui);
                 step(ui, 2, "Set the password", "type it twice to encrypt");
@@ -941,14 +1027,14 @@ impl App {
     }
 
     fn stego_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.header(ui, "Steganography", "Hide files inside images, or extract them");
+        self.header(ui, "Steganography", "Hide files or folders inside images, or extract them");
         ui.add_enabled_ui(!self.busy, |ui| {
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                if tab(ui, vec2(w, 44.0), "Hide a file", !self.s_extract, Tone::Green).clicked() {
+                if tab(ui, vec2(w, 44.0), "Hide a file or folder", !self.s_extract, Tone::Green).clicked() {
                     self.s_extract = false;
                 }
-                if tab(ui, vec2(w, 44.0), "Extract a file", self.s_extract, Tone::Blue).clicked() {
+                if tab(ui, vec2(w, 44.0), "Extract a file or folder", self.s_extract, Tone::Blue).clicked() {
                     self.s_extract = true;
                 }
             });
@@ -957,11 +1043,20 @@ impl App {
             card(ui, |ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
                     step(ui, 1, "Select the files", "");
-                    if path_row(ui, "File to hide", &mut self.h_secret, "Choose the file") {
-                        if let Some(p) = rfd::FileDialog::new().set_title("File to hide").pick_file() {
-                            self.h_secret = p.to_string_lossy().into_owned();
-                            self.picked("File to hide selected", &p);
+                    match path_row_dual(ui, "File or folder to hide", &mut self.h_secret, "Choose a file or a folder") {
+                        1 => {
+                            if let Some(p) = rfd::FileDialog::new().set_title("File to hide").pick_file() {
+                                self.h_secret = p.to_string_lossy().into_owned();
+                                self.picked("File to hide selected", &p);
+                            }
                         }
+                        2 => {
+                            if let Some(p) = rfd::FileDialog::new().set_title("Folder to hide").pick_folder() {
+                                self.h_secret = p.to_string_lossy().into_owned();
+                                self.picked("Folder to hide selected", &p);
+                            }
+                        }
+                        _ => {}
                     }
                     if path_row(ui, "Cover image", &mut self.h_cover, "PNG, JPG or BMP") {
                         if let Some(p) = images_dialog().set_title("Cover image").pick_file() {
@@ -1023,7 +1118,7 @@ impl App {
                     }
                     divider(ui);
                     step(ui, 2, "Choose the destination", "");
-                    if path_row(ui, "", &mut self.x_dir, "Folder for the extracted file") {
+                    if path_row(ui, "", &mut self.x_dir, "Folder for the extracted content") {
                         if let Some(p) = rfd::FileDialog::new().set_title("Destination folder").pick_folder() {
                             self.x_dir = p.to_string_lossy().into_owned();
                             self.picked("Destination folder set", &p);
@@ -1033,7 +1128,7 @@ impl App {
                     step(ui, 3, "Enter the password", "only if protected");
                     password_block(ui, "", &mut self.x_pw, None, &mut self.x_show);
                     ui.add_space(8.0);
-                    if button(ui, vec2(ui.available_width(), 46.0), "Extract file", Tone::Blue).clicked() {
+                    if button(ui, vec2(ui.available_width(), 46.0), "Extract", Tone::Blue).clicked() {
                         self.extract(ctx);
                     }
                 });

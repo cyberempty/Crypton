@@ -3,7 +3,7 @@
 <h1 align="center">Crypton</h1>
 
 <p align="center">
-Open-source desktop app to <b>encrypt files</b> with a password and <b>hide files inside images</b>.<br>
+Open-source desktop app to <b>encrypt files and folders</b> with a password and <b>hide them inside images</b>.<br>
 One self-contained file. No installation, no dependencies, no traces left on your system.
 </p>
 
@@ -23,8 +23,8 @@ One self-contained file. No installation, no dependencies, no traces left on you
 ## Features
 
 **Encryption**
-- Encrypts and decrypts **any file** with a password, producing a `.crypton` file.
-- The original **file name is stored encrypted** inside the file and suggested again when decrypting, even if the file was renamed.
+- Encrypts and decrypts **any file or whole folder** with a password, producing a single `.crypton` file. A folder keeps its sub-folders, empty folders and every file; decrypting rebuilds it.
+- The original **file or folder name is stored encrypted** inside the file and suggested again when decrypting, even if the file was renamed.
 - Content is **compressed** before encryption when it is worthwhile.
 - **Verify**: without a password it checks the structure of an encrypted file; with the password it runs the complete authenticity check. Nothing is written to disk.
 - **Info**: shows the details of an encrypted file or of an image with hidden data.
@@ -33,7 +33,8 @@ One self-contained file. No installation, no dependencies, no traces left on you
 - **Pixel (LSB)** method: spreads the data over the least significant bits of the pixels, evenly over the whole image. The result is saved as PNG or BMP only (lossy formats would destroy the data).
 - **Appended** method: adds the data after the end of the image file. The image stays byte-for-byte identical and displays normally.
 - Extraction **detects the method by itself** and whether a password is needed.
-- The hidden file can be password-protected; in that case its **name is encrypted** too.
+- You can hide a **single file or a whole folder**; extraction rebuilds the folder by itself.
+- The hidden content can be password-protected; in that case its **name is encrypted** too.
 
 **Interface**
 - Dark, minimal, fixed-size window with numbered steps, colored action buttons and a notification system.
@@ -45,24 +46,24 @@ The start screen has two options: **Encryption** and **Steganography**. **Back**
 
 ### Encryption
 
-1. **Choose a file**: click **Browse** or paste its path.
+1. **Choose a file or a folder**: click **Browse file** or **Browse folder**, or paste the path. To decrypt, choose the `.crypton` file.
 2. **Set the password**: type it twice when encrypting. **Show** reveals what you typed.
 3. **Pick an action**:
-   - **Encrypt** (green): asks where to save the `.crypton` file.
-   - **Decrypt** (blue): checks everything first, then asks where to save the result.
+   - **Encrypt** (green): asks where to save the `.crypton` file (outside the folder, when encrypting a folder).
+   - **Decrypt** (blue): checks everything first, then asks where to save the file, or in which folder to rebuild the original folder.
    - **Verify** (orange): integrity check, no files written.
    - **Info** (violet): shows the details below the card.
 
 ### Steganography
 
-Two clearly separated tabs: **Hide a file** (green) and **Extract a file** (blue).
+Two clearly separated tabs: **Hide a file or folder** (green) and **Extract a file or folder** (blue).
 
-**Hide a file**
-1. **Select the files**: the file to hide, the cover image (PNG, JPG or BMP) and where to save the result. The output name is suggested automatically.
+**Hide a file or folder**
+1. **Select the files**: the file or folder to hide (**Browse file** / **Browse folder** buttons), the cover image (PNG, JPG or BMP) and where to save the result. The output name is suggested automatically.
 2. **Choose the method**: *Pixel (LSB)* or *Appended to file* (hover an option for details).
 3. **Protect it** (optional): tick the box and type the password twice.
 
-**Extract a file**
+**Extract a file or folder**
 1. **Select the image**; the method is detected automatically.
 2. **Choose the destination folder**.
 3. **Enter the password**, only if the content is protected.
@@ -91,6 +92,8 @@ A violet notification with a progress bar is shown while an operation is running
 - **Memory hygiene:** keys, passwords and data are wiped as soon as they are no longer needed; a custom allocator wipes every freed block.
 - **No half-written output:** a decrypted file is written only after the *whole* file has been verified, through a temporary file that is renamed at the end. If anything fails, nothing is left behind.
 - **Safe extraction:** file names found inside images are sanitized (no paths, no reserved Windows names), so writing outside the chosen folder is impossible, and an existing file is never overwritten.
+- **Safe folder restore:** every path inside a folder archive is validated (no `..`, no absolute paths, no links are ever created), the whole archive is verified before anything is written, and the folder is built in a hidden staging folder that is renamed only when everything succeeded. A restored folder never replaces an existing one: a new name such as `Name (1)` is used.
+- **No plaintext on disk when encrypting a folder:** it is read and encrypted in a single stream, with no temporary archive.
 - **Hostile-file hardening:** key-derivation parameters read from a file are bounded, so a crafted file cannot request gigabytes of memory.
 - All keys are 256 bits, which is also considered safe against future quantum computers (Grover's algorithm halves the effective strength to 128 bits). In practice the weakest link is always the password.
 
@@ -122,7 +125,19 @@ Payload inside an image: `"CRST"` + flag. Flag `0`: name, data and CRC-32 in the
 - **Pixel method:** a 96-bit header in the first bits (`"CLSB"`, payload length, start offset), then the payload bits evenly spaced over the rest of the image, one bit per R/G/B channel. The alpha channel is left untouched.
 - **Appended method:** `image bytes + payload + length (u64) + "CRYPTAIL"`.
 
-The code is documented in `source/src/crypto.rs` and `source/src/stego.rs`.
+### Folder archive
+
+A folder is turned into one byte stream and then handled exactly like a file (encrypted, or used as hidden content). The stream is `magic` (`89 "CRDIR" 1A 0A`), then one record per item, then an end marker. Items are stored in pre-order, sorted by name, with `/` as separator.
+
+| Record | Layout |
+|---|---|
+| folder | `1` (u8), path length (u16), path (UTF-8) |
+| file | `2` (u8), path length (u16), path (UTF-8), size (u64), data |
+| end | `0` (u8) |
+
+The name of the folder itself is stored in the usual metadata (`.crypton`) or payload (image) name field. Old versions of Crypton can still decrypt such a file, but they will give you the raw archive instead of the folder.
+
+The code is documented in `source/src/crypto.rs`, `source/src/stego.rs` and `source/src/folder.rs`.
 
 ## Limitations
 
@@ -135,19 +150,27 @@ Please read these before trusting Crypton with something important.
 - **Sizes and timing leak:** the approximate size of an encrypted file is visible.
 - **Re-encoding destroys hidden data:** social networks and messaging apps recompress images. Use PNG or BMP for the pixel method and send the file as a document.
 - The `.crypton` format is specific to Crypton; other programs cannot open it.
+- **Folders:** symbolic links and special files are skipped (and counted in the notification), file permissions and timestamps are not stored, and file names must be valid text. Hiding a folder in an image is limited to **512 MiB** (the archive is built in memory); encrypting a folder to a `.crypton` file has no such limit.
 
 ## System requirements
 
 | | Requirement |
 |---|---|
 | **Windows** | Windows 10 or later, 64-bit; graphics driver with OpenGL 2.0 |
-| **Linux** | x86-64, glibc 2.17 or newer (any distribution from 2012 on); X11 or Wayland; OpenGL 2.0 (Mesa or vendor driver). The **Browse** dialogs use the desktop's `xdg-desktop-portal`; if it is missing, paste file paths into the fields instead |
-| **Linux ARM64** | same as Linux x86-64, on a 64-bit ARM processor |
-| **All** | about 300 MB of free memory while encrypting or decrypting (Argon2id uses 256 MiB); the launcher itself is 6-9 MB |
+| **Linux** | x86-64 **or ARM64** (the single `Crypton-Linux` file contains both and picks the right one), glibc 2.17 or newer (any distribution from 2012 on); X11 or Wayland; OpenGL 2.0 (Mesa or vendor driver). The **Browse** dialogs use the desktop's `xdg-desktop-portal`; if it is missing, paste file paths into the fields instead |
+| **macOS** | macOS 10.13 or later. No ready-made binary is included: double-click `Crypton-macOS.command`, which builds Crypton from `source/` on the first run (needs Rust and Apple's command line tools, both offered automatically) |
+| **All** | about 300 MB of free memory while encrypting or decrypting (Argon2id uses 256 MiB); the launchers are 6-8 MB |
 
 Virtual machines and remote desktops without 3D acceleration may not provide OpenGL 2.0.
 
-**Linux.** If the file lost its executable bit: `chmod +x Crypton-Linux`.
+**Linux.** One file for every Linux, on both x86-64 and ARM64: `Crypton-Linux`. On start it unpacks the program for your processor into a private temporary folder and deletes it when you close Crypton (nothing is installed). If the file lost its executable bit: `chmod +x Crypton-Linux`. The version number is shown at the bottom of the home screen.
+
+**macOS.** Double-click `Crypton-macOS.command`. If macOS refuses to open it because it was downloaded, right-click it, choose **Open**, then **Open** again (or run `xattr -d com.apple.quarantine Crypton-macOS.command` once in Terminal). The script:
+
+1. opens `Crypton.app` if one is next to it;
+2. otherwise builds Crypton from `source/` (a few minutes, the first time only), then starts it. It rebuilds by itself only when the source changes.
+
+To make a universal `Crypton.app` (Intel + Apple Silicon) that can be shared, run `source/build-macos.sh` on a Mac.
 
 ## Building from source
 
@@ -187,15 +210,23 @@ pip install ziglang && cargo install cargo-zigbuild
 cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 ```
 
-Rename `target/.../release/crypton` to `Crypton-Linux`. For 64-bit ARM Linux use the same command with `--target aarch64-unknown-linux-gnu.2.17` (after `rustup target add aarch64-unknown-linux-gnu`) and name the result `Crypton-Linux-arm64`.
+Build it also for 64-bit ARM Linux (`--target aarch64-unknown-linux-gnu.2.17`, after `rustup target add aarch64-unknown-linux-gnu`), then join the two programs into the single `Crypton-Linux` file:
+
+```sh
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.17
+sh packaging/linux/make-launcher.sh \
+  target/x86_64-unknown-linux-gnu/release/crypton \
+  target/aarch64-unknown-linux-gnu/release/crypton \
+  ../Crypton-Linux
+```
 
 ## Project layout
 
 ```
 Crypton/
 ├── Crypton-Windows.exe          single, self-contained launcher for Windows
-├── Crypton-Linux                single, self-contained launcher for Linux (x86-64)
-├── Crypton-Linux-arm64          single, self-contained launcher for Linux (ARM64)
+├── Crypton-Linux                single launcher for every Linux (x86-64 and ARM64)
+├── Crypton-macOS.command        double-click launcher for macOS (builds from source on first run)
 ├── README.md
 ├── LICENSE
 ├── images/                      screenshots used in this README
@@ -214,7 +245,8 @@ Crypton/
         ├── gui.rs               interface (egui): screens, widgets, notifications
         ├── crypto.rs            .crypton format, key derivation, double encryption
         ├── stego.rs             steganography (pixel and appended methods)
-        ├── ops.rs               file operations: encrypt, decrypt, verify, info
+        ├── folder.rs            folders: streaming archive, safe restore
+        ├── ops.rs               file and folder operations: encrypt, decrypt, verify, info
         └── util.rs              errors, progress, secure buffers, safe file names
 ```
 

@@ -179,6 +179,19 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True if `path` (which may not exist yet) lives inside the folder `dir`.
+pub fn is_inside(path: &Path, dir: &Path) -> bool {
+    let Ok(d) = fs::canonicalize(dir) else { return false };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    match fs::canonicalize(parent) {
+        Ok(p) => p.starts_with(d),
+        Err(_) => false,
+    }
+}
+
 /// Reduces a name coming from untrusted data to a plain file name: no paths,
 /// no reserved Windows names, no odd characters.
 pub fn sanitize_name(name: &str) -> String {
